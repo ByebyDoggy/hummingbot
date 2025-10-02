@@ -1,6 +1,6 @@
 import time
 from decimal import Decimal
-from typing import Dict, List, Set, Optional
+from typing import Dict, List, Optional, Set
 
 import pandas as pd
 from pydantic import Field, field_validator
