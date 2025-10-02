@@ -6,13 +6,13 @@ from typing import Dict
 from hummingbot.connector.connector_base import ConnectorBase, Union
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
-from hummingbot.core.data_type.order_candidate import OrderCandidate
+from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate, PositionAction
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
     BuyOrderCreatedEvent,
     MarketOrderFailureEvent,
     SellOrderCompletedEvent,
-    SellOrderCreatedEvent,
+    SellOrderCreatedEvent, OrderCancelledEvent,
 )
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.logger import HummingbotLogger
@@ -104,6 +104,7 @@ class XEMMExecutor(ExecutorBase):
         super().__init__(strategy=strategy,
                          connectors=[config.buying_market.connector_name, config.selling_market.connector_name],
                          config=config, update_interval=update_interval)
+        self.to_canceled_orders:list[TrackedOrder] = []
 
     async def validate_sufficient_balance(self):
         mid_price = self.get_price(self.maker_connector, self.maker_trading_pair,
@@ -114,19 +115,37 @@ class XEMMExecutor(ExecutorBase):
             order_type=OrderType.LIMIT,
             order_side=self.maker_order_side,
             amount=self.config.order_amount,
-            price=mid_price,)
+            price=mid_price, ) if not self.is_perpetual_connector(self.maker_connector) else \
+            PerpetualOrderCandidate(
+                trading_pair=self.maker_trading_pair,
+                is_maker=True,
+                order_type=OrderType.LIMIT,
+                order_side=self.maker_order_side,
+                amount=self.config.order_amount,
+                price=mid_price,
+                leverage=Decimal(self.config.maker_leverage),
+            )
         taker_order_candidate = OrderCandidate(
             trading_pair=self.taker_trading_pair,
             is_maker=False,
             order_type=OrderType.MARKET,
             order_side=self.taker_order_side,
             amount=self.config.order_amount,
-            price=mid_price,)
+            price=mid_price, ) if not self.is_perpetual_connector(self.taker_connector) else \
+            PerpetualOrderCandidate(
+                trading_pair=self.taker_trading_pair,
+                is_maker=False,
+                order_type=OrderType.MARKET,
+                order_side=self.taker_order_side,
+                amount=self.config.order_amount,
+                price=mid_price,
+                leverage=Decimal(self.config.taker_leverage),
+            )
         maker_adjusted_candidate = self.adjust_order_candidates(self.maker_connector, [maker_order_candidate])[0]
         taker_adjusted_candidate = self.adjust_order_candidates(self.taker_connector, [taker_order_candidate])[0]
         if maker_adjusted_candidate.amount == Decimal("0") or taker_adjusted_candidate.amount == Decimal("0"):
             self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.logger().error("Not enough budget to open position.")
+            self.logger().error(f"{self.maker_connector if maker_adjusted_candidate.amount == Decimal('0') else self.taker_connector} don't enough budget to open position.")
             self.stop()
 
     async def control_task(self):
@@ -150,9 +169,11 @@ class XEMMExecutor(ExecutorBase):
             order_amount=self.config.order_amount)
         await self.update_tx_costs()
         if self.taker_order_side == TradeType.BUY:
-            self._maker_target_price = self._taker_result_price * (1 + self.config.target_profitability + self._tx_cost_pct)
+            self._maker_target_price = self._taker_result_price * (
+                        1 + self.config.target_profitability + self._tx_cost_pct)
         else:
-            self._maker_target_price = self._taker_result_price * (1 - self.config.target_profitability - self._tx_cost_pct)
+            self._maker_target_price = self._taker_result_price * (
+                        1 - self.config.target_profitability - self._tx_cost_pct)
 
     async def update_tx_costs(self):
         base, quote = split_hb_trading_pair(trading_pair=self.config.buying_market.trading_pair)
@@ -197,7 +218,17 @@ class XEMMExecutor(ExecutorBase):
                 amount=order_amount,
                 price=self._taker_result_price,
                 is_maker=order_type.is_limit_type(),
-            )
+            ) if not self.is_perpetual_connector(connector.name) else \
+                connector.get_fee(
+                    base_currency=asset,
+                    quote_currency=trading_pair.split("-")[1],
+                    order_type=order_type,
+                    order_side=TradeType.BUY if is_buy else TradeType.SELL,
+                    amount=order_amount,
+                    price=self._taker_result_price,
+                    is_maker=order_type.is_limit_type(),
+                    position_action=PositionAction.OPEN
+                )
             return fee.fee_amount_in_token(
                 trading_pair=trading_pair,
                 price=self._taker_result_price,
@@ -217,7 +248,9 @@ class XEMMExecutor(ExecutorBase):
             order_type=OrderType.LIMIT,
             side=self.maker_order_side,
             amount=self.config.order_amount,
-            price=self._maker_target_price)
+            price=self._maker_target_price,
+            position_action=PositionAction.OPEN if self.is_perpetual_connector(
+                self.maker_connector) else PositionAction.NIL)
         self.maker_order = TrackedOrder(order_id=order_id)
         self.logger().info(f"Created maker order {order_id} at price {self._maker_target_price}.")
 
@@ -229,14 +262,19 @@ class XEMMExecutor(ExecutorBase):
     async def control_update_maker_order(self):
         await self.update_current_trade_profitability()
         if self._current_trade_profitability - self._tx_cost_pct < self.config.min_profitability:
-            self.logger().info(f"Trade profitability {self._current_trade_profitability - self._tx_cost_pct} is below minimum profitability. Cancelling order.")
+            self.logger().info(
+                f"Trade profitability {self._current_trade_profitability - self._tx_cost_pct} is below minimum profitability. Cancelling order.")
             self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
-            self.maker_order = None
+            self.to_canceled_orders.append(self.maker_order)
         elif self._current_trade_profitability - self._tx_cost_pct > self.config.max_profitability:
-            self.logger().info(f"Trade profitability {self._current_trade_profitability - self._tx_cost_pct} is above target profitability. Cancelling order.")
+            self.logger().info(
+                f"Trade profitability {self._current_trade_profitability - self._tx_cost_pct} is above target profitability. Cancelling order.")
             self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
-            self.maker_order = None
-
+            self.to_canceled_orders.append(self.maker_order)
+        elif len(self.to_canceled_orders):
+            self.to_canceled_orders = [order for order in self.to_canceled_orders if order.is_open]
+            for order in self.to_canceled_orders:
+                self._strategy.cancel(self.maker_connector, self.maker_trading_pair, order.order_id)
     async def update_current_trade_profitability(self):
         trade_profitability = Decimal("0")
         if self.maker_order and self.maker_order.order and self.maker_order.order.is_open:
@@ -278,20 +316,32 @@ class XEMMExecutor(ExecutorBase):
             self.place_taker_order()
             self._status = RunnableStatus.SHUTTING_DOWN
 
+    def process_order_canceled_event(self,
+                                     event_tag: int,
+                                     market: ConnectorBase,
+                                     event: OrderCancelledEvent):
+        if self.maker_order and event.order_id == self.maker_order.order_id:
+            self.maker_order = None
+            self.to_canceled_orders = []
+
     def place_taker_order(self):
         taker_order_id = self.place_order(
             connector_name=self.taker_connector,
             trading_pair=self.taker_trading_pair,
             order_type=OrderType.MARKET,
             side=self.taker_order_side,
-            amount=self.config.order_amount)
+            amount=self.config.order_amount,
+            position_action=PositionAction.OPEN)
         self.taker_order = TrackedOrder(order_id=taker_order_id)
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
+        self.logger().error(f'order {event.order_id} failed. failure msg:{event.error_message},'
+                              f'error_type:{event.error_type}')
         if self.maker_order and self.maker_order.order_id == event.order_id:
             self.failed_orders.append(self.maker_order)
-            self.maker_order = None
             self._current_retries += 1
+            self.maker_order = None
+            self.to_canceled_orders = []
         elif self.taker_order and self.taker_order.order_id == event.order_id:
             self.failed_orders.append(self.taker_order)
             self._current_retries += 1
@@ -320,8 +370,9 @@ class XEMMExecutor(ExecutorBase):
 
     def early_stop(self, keep_position: bool = False):
         if self.maker_order and self.maker_order.order and self.maker_order.order.is_open:
-            self.logger().info(f"Cancelling maker order {self.maker_order.order_id}.")
+            self.logger().info(f"Cancelling maker order {self.maker_order.order_id} for early stop.")
             self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
+            self.to_canceled_orders.append(self.maker_order)
         self.close_type = CloseType.EARLY_STOP
         self.stop()
 
@@ -349,6 +400,9 @@ class XEMMExecutor(ExecutorBase):
         Example: For M3M3/USDT and M3M3/USDC, fetch the USDC/USDT rate.
         """
         try:
+            taker_quote,maker_quote = split_hb_trading_pair(self.quote_conversion_pair)
+            if self._are_tokens_interchangeable(taker_quote,maker_quote):
+                return Decimal('1')
             conversion_rate = self.rate_oracle.get_pair_rate(self.quote_conversion_pair)
             if conversion_rate is None:
                 self.logger().error(f"Could not fetch conversion rate for {self.quote_conversion_pair}")

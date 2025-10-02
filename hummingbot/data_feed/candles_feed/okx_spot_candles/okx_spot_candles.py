@@ -5,6 +5,10 @@ from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.okx_spot_candles import constants as CONSTANTS
 from hummingbot.logger import HummingbotLogger
+import asyncio
+import time
+_health_check_cache = {"time": 0, "status": NetworkStatus.NOT_CONNECTED}
+_health_check_lock = asyncio.Lock()
 
 
 class OKXSpotCandles(CandlesBase):
@@ -55,11 +59,29 @@ class OKXSpotCandles(CandlesBase):
     def intervals(self):
         return CONSTANTS.INTERVALS
 
+    # async def check_network(self) -> NetworkStatus:
+    #     rest_assistant = await self._api_factory.get_rest_assistant()
+    #     await rest_assistant.execute_request(url=self.health_check_url,
+    #                                          throttler_limit_id=CONSTANTS.HEALTH_CHECK_ENDPOINT)
+    #     return NetworkStatus.CONNECTED
+
     async def check_network(self) -> NetworkStatus:
-        rest_assistant = await self._api_factory.get_rest_assistant()
-        await rest_assistant.execute_request(url=self.health_check_url,
-                                             throttler_limit_id=CONSTANTS.HEALTH_CHECK_ENDPOINT)
-        return NetworkStatus.CONNECTED
+        interval = 60  # 最少 60 秒发一次请求
+        async with _health_check_lock:
+            now = int(time.time())
+            if now - _health_check_cache["time"] > interval:
+                try:
+                    rest_assistant = await self._api_factory.get_rest_assistant()
+                    await rest_assistant.execute_request(
+                        url=self.health_check_url,
+                        throttler_limit_id=CONSTANTS.HEALTH_CHECK_ENDPOINT
+                    )
+                    _health_check_cache["status"] = NetworkStatus.CONNECTED
+                except Exception:
+                    _health_check_cache["status"] = NetworkStatus.NOT_CONNECTED
+                finally:
+                    _health_check_cache["time"] = now
+        return _health_check_cache["status"]
 
     def get_exchange_trading_pair(self, trading_pair):
         return trading_pair

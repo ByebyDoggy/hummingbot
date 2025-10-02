@@ -204,7 +204,7 @@ class StrategyV2Base(ScriptStrategyBase):
         # Collect initial positions from all controller configs
         self.executor_orchestrator = ExecutorOrchestrator(
             strategy=self,
-            initial_positions_by_controller=self._collect_initial_positions()
+            initial_positions_by_controller=self._collect_initial_positions(),
         )
         self.mqtt_enabled = False
         self._pub: Optional[ETopicPublisher] = None
