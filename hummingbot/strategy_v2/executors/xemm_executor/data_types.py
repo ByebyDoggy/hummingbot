@@ -16,7 +16,3 @@ class XEMMExecutorConfig(ExecutorConfigBase):
     max_profitability: Decimal
     taker_leverage: int
     maker_leverage: int
-    taker_leverage: int
-    maker_leverage: int
-    taker_leverage: int
-    maker_leverage: int

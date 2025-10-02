@@ -12,4 +12,3 @@ class ArbitrageExecutorConfig(ExecutorConfigBase):
     min_profitability: Decimal
     gas_conversion_price: Optional[Decimal] = None
     leverage: Optional[Decimal] = Decimal('1')
-    leverage: Optional[Decimal] = Decimal('1')
