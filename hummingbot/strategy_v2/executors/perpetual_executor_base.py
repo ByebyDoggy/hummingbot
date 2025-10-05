@@ -68,7 +68,7 @@ class PerpetualExecutorBase(RunnableBase):
             (MarketEvent.BuyOrderCompleted, self._complete_buy_order_forwarder),
             (MarketEvent.SellOrderCompleted, self._complete_sell_order_forwarder),
             (MarketEvent.OrderFailure, self._failed_order_forwarder),
-            (MarketEvent.FundingPaymentCompleted,)
+            (MarketEvent.FundingPaymentCompleted, self._funding_payment_forwarder)
         ]
 
     @property
