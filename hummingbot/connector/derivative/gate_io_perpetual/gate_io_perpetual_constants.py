@@ -1,5 +1,7 @@
 from hummingbot.core.api_throttler.data_types import LinkedLimitWeightPair, RateLimit
 
+OUTDATED_EX_TOKENS = ["ZKWASM_USDT"]
+
 EXCHANGE_NAME = "gate_io_perpetual"
 DEFAULT_DOMAIN = ""
 HBOT_BROKER_ID = "hummingbot"

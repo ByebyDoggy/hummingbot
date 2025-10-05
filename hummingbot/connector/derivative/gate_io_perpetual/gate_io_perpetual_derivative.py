@@ -21,7 +21,7 @@ from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativ
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.clock import Clock
-from hummingbot.core.data_type.common import OrderType, PositionMode, PositionSide, TradeType
+from hummingbot.core.data_type.common import OrderType, PositionMode, PositionSide, TradeType, PositionAction
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
@@ -292,7 +292,10 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
                            trade_type: TradeType,
                            order_type: OrderType,
                            price: Decimal,
+                           position_action: PositionAction = PositionAction.NIL,
                            **kwargs) -> Tuple[str, float]:
+        if position_action == PositionAction.NIL:
+            raise NotImplementedError
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         size = self._format_amount_to_size(trading_pair, amount)
         data = {
@@ -312,7 +315,8 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
                 "price": "0",
                 "tif": "ioc",
             })
-
+        if position_action == PositionAction.CLOSE:
+            data.update({'reduce_only': True})
         # RESTRequest does not support json, and if we pass a dict
         # the underlying aiohttp will encode it to params
         data = data
@@ -695,6 +699,8 @@ class GateIoPerpetualDerivative(PerpetualDerivativePyBase):
 
         for position in positions:
             ex_trading_pair = position.get("contract")
+            if ex_trading_pair in CONSTANTS.OUTDATED_EX_TOKENS:
+                continue
             hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(ex_trading_pair)
 
             amount = Decimal(position.get("size"))
