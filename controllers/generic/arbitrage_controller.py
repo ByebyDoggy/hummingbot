@@ -1,6 +1,7 @@
+import time
 from decimal import Decimal
 from typing import List, Optional
-
+from pydantic import Field
 import pandas as pd
 
 from hummingbot.client.ui.interface_utils import format_df_for_printout
@@ -17,16 +18,30 @@ from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction,
 class ArbitrageControllerConfig(ControllerConfigBase):
     controller_name: str = "arbitrage_controller"
     candles_config: List[CandlesConfig] = []
-    exchange_pair_1: ConnectorPair = ConnectorPair(connector_name="binance", trading_pair="SOL-USDT")
-    exchange_pair_2: ConnectorPair = ConnectorPair(connector_name="jupiter/router", trading_pair="SOL-USDC")
+    exchange_pair_1: ConnectorPair = Field(
+        default=ConnectorPair(connector_name="okx_perpetual", trading_pair="SOL-USDT"),
+        json_schema_extra={'dynamic_restart': True})
+    exchange_pair_2: ConnectorPair = Field(
+        default=ConnectorPair(connector_name="hyperliquid_perpetual", trading_pair="SOL-USD"),
+        json_schema_extra={'dynamic_restart': True})
     min_profitability: Decimal = Decimal("0.01")
     delay_between_executors: int = 10  # in seconds
     max_executors_imbalance: int = 1
-    rate_connector: str = "binance"
+    rate_connector: str = "binance_perpetual"
     quote_conversion_asset: str = "USDT"
+    leverage: Decimal = Decimal('1')
+    spread_converge_threshold: Decimal = Decimal("0.0005")  # 判断价差收敛阈值
+    min_profit_after_funding: Decimal = Decimal("0.001")  # 资金费结算后要求最小的平仓收益
+    distance_seconds_to_next_funding: int = 60 * 10  # 下一个资金费结算时间的时间间隔,若大于此间隔则开始检测资金费率尝试平仓
 
     def update_markets(self, markets: MarketDict) -> MarketDict:
-        return [markets.add_or_update(cp.connector_name, cp.trading_pair) for cp in [self.exchange_pair_1, self.exchange_pair_2]][-1]
+        if self.exchange_pair_1.connector_name not in markets:
+            markets[self.exchange_pair_1.connector_name] = set()
+        markets[self.exchange_pair_1.connector_name].add(self.exchange_pair_1.trading_pair)
+        if self.exchange_pair_2.connector_name not in markets:
+            markets[self.exchange_pair_2.connector_name] = set()
+        markets[self.exchange_pair_2.connector_name].add(self.exchange_pair_2.trading_pair)
+        return markets
 
 
 class ArbitrageController(ControllerBase):
@@ -43,6 +58,35 @@ class ArbitrageController(ControllerBase):
         self._initialize_gas_tokens()  # Fetch gas tokens during init
         self.initialize_rate_sources()
 
+        self._pending_close_arbitrage_perpetual_executors = {}  # key: executor, value: bool 是否已关闭
+
+    @staticmethod
+    def is_perpetual(connector_name: str) -> bool:
+        return connector_name.endswith("_perpetual")
+
+    @staticmethod
+    def _are_tokens_interchangeable(first_token: str, second_token: str):
+        interchangeable_tokens = [
+            {"WETH", "ETH"},
+            {"WBTC", "BTC"},
+            {"WBNB", "BNB"},
+            {"WPOL", "POL"},
+            {"WAVAX", "AVAX"},
+            {"WONE", "ONE"},
+            {"USDC", "USDC.E"},
+            {"WBTC", "BTC"},
+            {"USOL", "SOL"},
+            {"UETH", "ETH"},
+            {"UBTC", "BTC"}
+        ]
+        same_token_condition = first_token == second_token
+        tokens_interchangeable_condition = any(({first_token, second_token} <= interchangeable_pair
+                                                for interchangeable_pair
+                                                in interchangeable_tokens))
+        # for now, we will consider all the stablecoins interchangeable
+        stable_coins_condition = "USD" in first_token and "USD" in second_token
+        return same_token_condition or tokens_interchangeable_condition or stable_coins_condition
+
     def initialize_rate_sources(self):
         rates_required = []
         for connector_pair in [self.config.exchange_pair_1, self.config.exchange_pair_2]:
@@ -56,7 +100,8 @@ class ArbitrageController(ControllerBase):
                                                         trading_pair=f"{gas_token}-{quote}"))
 
             # Add rate source for quote conversion asset
-            if quote != self.config.quote_conversion_asset:
+            if quote != self.config.quote_conversion_asset and not self._are_tokens_interchangeable(quote,
+                                                                                                    self.config.quote_conversion_asset):
                 rates_required.append(ConnectorPair(connector_name=self.config.rate_connector,
                                                     trading_pair=f"{quote}-{self.config.quote_conversion_asset}"))
 
@@ -163,6 +208,7 @@ class ArbitrageController(ControllerBase):
                 order_amount=amount_quantized,
                 min_profitability=self.config.min_profitability,
                 gas_conversion_price=gas_conversion_price,
+                leverage=self.config.leverage
             )
             return CreateExecutorAction(
                 executor_config=arbitrage_config,

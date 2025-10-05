@@ -4,18 +4,21 @@ from decimal import Decimal
 from typing import Dict, Union
 
 from hummingbot.connector.utils import split_hb_trading_pair
-from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.event.events import BuyOrderCreatedEvent, MarketOrderFailureEvent, SellOrderCreatedEvent
+from hummingbot.core.data_type.common import OrderType, TradeType, PriceType, PositionAction
+from hummingbot.core.data_type.funding_info import FundingInfo
+from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
+from hummingbot.core.event.events import BuyOrderCreatedEvent, MarketOrderFailureEvent, SellOrderCreatedEvent, \
+    FundingPaymentCompletedEvent
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.strategy_v2.executors.arbitrage_executor.data_types import ArbitrageExecutorConfig
-from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+from hummingbot.strategy_v2.executors.perpetual_executor_base import PerpetualExecutorBase
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
 
-class ArbitrageExecutor(ExecutorBase):
+class ArbitrageExecutor(PerpetualExecutorBase):
     _logger = None
 
     @classmethod
@@ -68,16 +71,25 @@ class ArbitrageExecutor(ExecutorBase):
         # Order tracking
         self._buy_order: TrackedOrder = TrackedOrder()
         self._sell_order: TrackedOrder = TrackedOrder()
+        self._buy_close_order: TrackedOrder = TrackedOrder()
+        self._sell_close_order: TrackedOrder = TrackedOrder()
 
         self._last_buy_price = Decimal("1")
         self._last_sell_price = Decimal("1")
+        self._last_buy_close_price = Decimal("1")
+        self._last_sell_close_price = Decimal("1")
         self._trade_pnl_pct = Decimal("0")
+        self._trade_close_pnl_pct = Decimal("0")
         self._last_tx_cost = Decimal("0")
         self._last_buy_fee = Decimal("0")
         self._last_sell_fee = Decimal("0")
+        self._last_buy_close_fee = Decimal('0')
+        self._last_sell_close_fee = Decimal('0')
         self._current_profitability = Decimal("0")
         self._amm_gas_amount = Decimal("0")
         self._amm_gas_cost = Decimal("0")
+
+        self._funding_payment_profit = Decimal('0')
 
         # Quote asset conversion rate
         _, buy_quote_asset = split_hb_trading_pair(self.buying_market.trading_pair)
@@ -88,33 +100,54 @@ class ArbitrageExecutor(ExecutorBase):
         self.rate_oracle = RateOracle.get_instance()
         self._cumulative_failures = 0
 
-    async def validate_sufficient_balance(self):
-        base_asset_for_selling_exchange = self.connectors[self.selling_market.connector_name].get_available_balance(
-            self.selling_market.trading_pair.split("-")[0])
-        if self.order_amount > base_asset_for_selling_exchange:
-            self.logger().info(f"Insufficient balance in exchange {self.selling_market.connector_name} "
-                               f"to sell {self.selling_market.trading_pair.split('-')[0]} "
-                               f"Actual: {base_asset_for_selling_exchange} --> Needed: {self.order_amount}")
-            self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.logger().error("Not enough budget to open position.")
-            self.stop()
-            return
+        self._arbitrage_close_flag = False
 
-        price = await self.get_resulting_price_for_amount(
-            exchange=self.buying_market.connector_name,
+    async def validate_sufficient_balance(self):
+        buying_mid_price = self.get_price(self.buying_market.connector_name, self.buying_market.trading_pair,
+                                          price_type=PriceType.MidPrice)
+        buying_order_candidate = OrderCandidate(
             trading_pair=self.buying_market.trading_pair,
-            is_buy=True,
-            order_amount=self.order_amount)
-        quote_asset_for_buying_exchange = self.connectors[self.buying_market.connector_name].get_available_balance(
-            self.buying_market.trading_pair.split("-")[1])
-        if self.order_amount * price > quote_asset_for_buying_exchange:
-            self.logger().info(f"Insufficient balance in exchange {self.buying_market.connector_name} "
-                               f"to buy {self.buying_market.trading_pair.split('-')[1]} "
-                               f"Actual: {quote_asset_for_buying_exchange} --> Needed: {self.order_amount * price}")
+            is_maker=False,
+            order_type=OrderType.MARKET,
+            order_side=TradeType.BUY,
+            amount=self.config.order_amount,
+            price=buying_mid_price, ) if not self.is_perpetual_connector(self.buying_market.connector_name) else \
+            PerpetualOrderCandidate(
+                trading_pair=self.buying_market.trading_pair,
+                is_maker=False,
+                order_type=OrderType.MARKET,
+                order_side=TradeType.BUY,
+                amount=self.config.order_amount,
+                price=buying_mid_price,
+                leverage=Decimal(self.config.leverage),
+            )
+        selling_mid_price = self.get_price(self.selling_market.connector_name, self.selling_market.trading_pair,
+                                           price_type=PriceType.MidPrice)
+        selling_order_candidate = OrderCandidate(
+            trading_pair=self.selling_market.trading_pair,
+            is_maker=False,
+            order_type=OrderType.MARKET,
+            order_side=TradeType.SELL,
+            amount=self.config.order_amount,
+            price=selling_mid_price, ) if not self.is_perpetual_connector(self.selling_market.connector_name) else \
+            PerpetualOrderCandidate(
+                trading_pair=self.selling_market.trading_pair,
+                is_maker=False,
+                order_type=OrderType.MARKET,
+                order_side=TradeType.SELL,
+                amount=self.config.order_amount,
+                price=selling_mid_price,
+                leverage=Decimal(self.config.leverage),
+            )
+        buying_adjusted_candidate = \
+            self.adjust_order_candidates(self.buying_market.connector_name, [buying_order_candidate])[0]
+        selling_adjusted_candidate = \
+            self.adjust_order_candidates(self.selling_market.connector_name, [selling_order_candidate])[0]
+        if buying_adjusted_candidate.amount == Decimal("0") or selling_adjusted_candidate.amount == Decimal("0"):
             self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.logger().error("Not enough budget to open position.")
+            self.logger().error(
+                f"{self.buying_market.connector_name if buying_adjusted_candidate.amount == Decimal('0') else self.selling_market.connector_name} don't enough budget to open position.")
             self.stop()
-            return
 
     def is_arbitrage_valid(self, pair1, pair2):
         base_asset1, quote_asset1 = split_hb_trading_pair(pair1)
@@ -125,21 +158,24 @@ class ArbitrageExecutor(ExecutorBase):
         if self.close_type == CloseType.COMPLETED:
             sell_quote_amount = self.sell_order.order.executed_amount_base * self.sell_order.average_executed_price
             buy_quote_amount = self.buy_order.order.executed_amount_base * self.buy_order.average_executed_price
-            return sell_quote_amount - buy_quote_amount - self.cum_fees_quote
+            buy_close_quote_amount = self.buy_close_order.executed_amount_base * self.buy_close_order.average_executed_price
+            sell_close_quote_amount = self.sell_close_order.executed_amount_base * self.sell_close_order.average_executed_price
+            return buy_close_quote_amount - sell_close_quote_amount + sell_quote_amount - buy_quote_amount - self.cum_fees_quote + self._funding_payment_profit
         else:
             return Decimal("0")
 
     def get_net_pnl_pct(self) -> Decimal:
         if self.is_closed:
             if self.buy_order.order and self.buy_order.order.executed_amount_base > 0:
-                return self.net_pnl_quote / self.buy_order.order.executed_amount_base
+                return self.net_pnl_quote / self.buy_order.order.executed_amount_quote
             else:
                 return Decimal("0")
         else:
             return Decimal("0")
 
     def get_cum_fees_quote(self) -> Decimal:
-        return self.buy_order.cum_fees_quote + self.sell_order.cum_fees_quote
+        return self.buy_order.cum_fees_quote + self.sell_order.cum_fees_quote + \
+            self._last_buy_close_fee + self._last_sell_close_fee
 
     @property
     def buy_order(self) -> TrackedOrder:
@@ -157,6 +193,36 @@ class ArbitrageExecutor(ExecutorBase):
     def sell_order(self, value: TrackedOrder):
         self._sell_order = value
 
+    @property
+    def buy_close_order(self) -> TrackedOrder:
+        return self._buy_close_order
+
+    @buy_close_order.setter
+    def buy_close_order(self, value: TrackedOrder):
+        self._buy_close_order = value
+
+    @property
+    def sell_close_order(self) -> TrackedOrder:
+        return self._sell_close_order
+
+    @sell_close_order.setter
+    def sell_close_order(self, value: TrackedOrder):
+        self._sell_close_order = value
+
+    def get_funding_rate_profit(self):
+        ret = 0
+        if self.is_perpetual_connector(self.buying_market.connector_name):
+            funding_rate: FundingInfo = self.connectors[self.buying_market.connector_name].get_funding_info(
+                self.buying_market.trading_pair
+            )
+            ret -= funding_rate.rate
+        if self.is_perpetual_connector(self.selling_market.connector_name):
+            funding_rate: FundingInfo = self.connectors[self.selling_market.connector_name].get_funding_info(
+                self.selling_market.trading_pair
+            )
+            ret += funding_rate.rate
+        return ret
+
     async def get_resulting_price_for_amount(self, exchange: str, trading_pair: str, is_buy: bool,
                                              order_amount: Decimal):
         return await self.connectors[exchange].get_quote_price(trading_pair, is_buy, order_amount)
@@ -165,8 +231,11 @@ class ArbitrageExecutor(ExecutorBase):
         if self.status == RunnableStatus.RUNNING:
             try:
                 await self.update_trade_pnl_pct()
+                await self.update_trade_close_pnl_pct()
                 await self.update_tx_cost()
-                self._current_profitability = (self._trade_pnl_pct * self.order_amount - self._last_tx_cost) / self.order_amount
+                funding_rate_profit = self.get_funding_rate_profit()
+                self._current_profitability = (self._trade_pnl_pct * self.order_amount - self._last_tx_cost) \
+                                              / self.order_amount + funding_rate_profit
                 if self._current_profitability > self.min_profitability:
                     await self.execute_arbitrage()
             except Exception as e:
@@ -180,13 +249,60 @@ class ArbitrageExecutor(ExecutorBase):
 
     def early_stop(self, keep_position: bool = False):
         self.close_type = CloseType.EARLY_STOP
+        if self.is_perpetual_connector(self.buying_market.connector_name) and \
+                self.is_perpetual_connector(self.selling_market.connector_name):
+            self.place_sell_close_arbitrage_order()
+            self.place_buy_close_arbitrage_order()
         self.stop()
+
+    def __get_current_profit__(self):
+        """
+        Return: 基于已成交订单及已经支付的资金费还有实时平仓价格后计算的收益率（未包含即将到来的资金费）
+        """
+        sell_quote_amount = self.sell_order.order.executed_amount_base * self.sell_order.average_executed_price
+        buy_quote_amount = self.buy_order.order.executed_amount_base * self.buy_order.average_executed_price
+        return sell_quote_amount - buy_quote_amount - self.cum_fees_quote + self._funding_payment_profit \
+            + self.config.order_amount * self._trade_close_pnl_pct
+
+    @staticmethod
+    def calculate_funding_profit(funding_rate, amount, is_buy):
+        return amount * (-funding_rate if is_buy else funding_rate)
 
     def check_order_status(self):
         if self.buy_order.order and self.buy_order.order.is_filled and \
                 self.sell_order.order and self.sell_order.order.is_filled:
-            self.close_type = CloseType.COMPLETED
-            self.stop()
+            if self.is_perpetual_connector(self.buying_market.connector_name) and \
+                    self.is_perpetual_connector(self.selling_market.connector_name):
+                if not self._arbitrage_close_flag:
+                    # 存在任意一个合约交易所，需要处理平仓
+                    buying_market_funding_info: FundingInfo = self.connectors[
+                        self.buying_market.connector_name].get_funding_info(self.buying_market.trading_pair)
+                    selling_market_funding_info: FundingInfo = self.connectors[
+                        self.selling_market.connector_name].get_funding_info(self.selling_market.trading_pair)
+                    estimate_next_funding_profit = self.calculate_funding_profit(buying_market_funding_info.rate,
+                                                                                 self.config.order_amount,
+                                                                                 is_buy=True) + \
+                                                   self.calculate_funding_profit(selling_market_funding_info.rate,
+                                                                                 self.config.order_amount,
+                                                                                 is_buy=False)
+                    current_profit = self.__get_current_profit__()
+                    if (current_profit + estimate_next_funding_profit) < \
+                            self.config.min_profitability * Decimal('0.5') and \
+                            current_profit > self.config.min_profitability * 0.5:
+                        self._arbitrage_close_flag = True
+                    if current_profit > self.config.min_profitability * Decimal('0.9'):
+                        self._arbitrage_close_flag = True
+                    if self._arbitrage_close_flag:
+                        self.place_sell_close_arbitrage_order()
+                        self.place_buy_close_arbitrage_order()
+                else:
+                    if self._buy_close_order.order and self.buy_close_order.is_filled and \
+                            self.sell_close_order and self.sell_close_order.is_filled:
+                        self.close_type = CloseType.COMPLETED
+                        self.stop()
+            else:
+                self.close_type = CloseType.COMPLETED
+                self.stop()
 
     async def execute_arbitrage(self):
         self._status = RunnableStatus.SHUTTING_DOWN
@@ -201,6 +317,8 @@ class ArbitrageExecutor(ExecutorBase):
             side=TradeType.BUY,
             amount=self.order_amount,
             price=self._last_buy_price,
+            position_action=PositionAction.OPEN if self.is_perpetual_connector(
+                self.buying_market.connector_name) else PositionAction.NIL
         )
 
     def place_sell_arbitrage_order(self):
@@ -211,6 +329,32 @@ class ArbitrageExecutor(ExecutorBase):
             side=TradeType.SELL,
             amount=self.order_amount,
             price=self._last_sell_price,
+            position_action=PositionAction.OPEN if self.is_perpetual_connector(
+                self.selling_market.connector_name) else PositionAction.NIL
+        )
+
+    def place_buy_close_arbitrage_order(self):
+        self.buy_close_order.order_id = self.place_order(
+            connector_name=self.buying_market.connector_name,
+            trading_pair=self.buying_market.trading_pair,
+            order_type=OrderType.MARKET,
+            side=TradeType.SELL,
+            amount=self.order_amount,
+            price=self._last_buy_price,
+            position_action=PositionAction.CLOSE if self.is_perpetual_connector(
+                self.buying_market.connector_name) else PositionAction.NIL
+        )
+
+    def place_sell_close_arbitrage_order(self):
+        self.sell_close_order.order_id = self.place_order(
+            connector_name=self.selling_market.connector_name,
+            trading_pair=self.selling_market.trading_pair,
+            order_type=OrderType.MARKET,
+            side=TradeType.BUY,
+            amount=self.order_amount,
+            price=self._last_sell_price,
+            position_action=PositionAction.CLOSE if self.is_perpetual_connector(
+                self.selling_market.connector_name) else PositionAction.NIL
         )
 
     async def update_tx_cost(self):
@@ -224,15 +368,31 @@ class ArbitrageExecutor(ExecutorBase):
             order_amount=self.order_amount,
             asset=base_without_wrapped
         )
+        buy_close_fee = await self.get_tx_cost_in_asset(
+            exchange=self.buying_market.connector_name,
+            trading_pair=self.buying_market.trading_pair,
+            is_buy=False,
+            order_amount=self.order_amount,
+            asset=base_without_wrapped
+        )
         sell_fee = await self.get_tx_cost_in_asset(
             exchange=self.selling_market.connector_name,
             trading_pair=self.selling_market.trading_pair,
             is_buy=False,
             order_amount=self.order_amount,
             asset=base_without_wrapped)
+        sell_close_fee = await self.get_tx_cost_in_asset(
+            exchange=self.selling_market.connector_name,
+            trading_pair=self.selling_market.trading_pair,
+            is_buy=True,
+            order_amount=self.order_amount,
+            asset=base_without_wrapped)
         self._last_buy_fee = buy_fee
         self._last_sell_fee = sell_fee
-        self._last_tx_cost = self._last_buy_fee + self._last_sell_fee
+        self._last_buy_close_fee = buy_close_fee
+        self._last_sell_close_fee = sell_close_fee
+        self._last_tx_cost = self._last_buy_fee + self._last_sell_fee + \
+                             self._last_buy_close_fee + self._last_sell_close_fee
 
     async def get_buy_and_sell_prices(self):
         buy_price_task = asyncio.create_task(self.get_resulting_price_for_amount(
@@ -249,6 +409,21 @@ class ArbitrageExecutor(ExecutorBase):
         buy_price, sell_price = await asyncio.gather(buy_price_task, sell_price_task)
         return buy_price, sell_price
 
+    async def get_buy_and_sell_close_prices(self):
+        buy_price_task = asyncio.create_task(self.get_resulting_price_for_amount(
+            exchange=self.buying_market.connector_name,
+            trading_pair=self.buying_market.trading_pair,
+            is_buy=False,
+            order_amount=self.order_amount))
+        sell_price_task = asyncio.create_task(self.get_resulting_price_for_amount(
+            exchange=self.selling_market.connector_name,
+            trading_pair=self.selling_market.trading_pair,
+            is_buy=True,
+            order_amount=self.order_amount))
+
+        buy_close_price, sell_close_price = await asyncio.gather(buy_price_task, sell_price_task)
+        return buy_close_price, sell_close_price
+
     async def update_trade_pnl_pct(self):
         self._last_buy_price, self._last_sell_price = await self.get_buy_and_sell_prices()
 
@@ -264,6 +439,16 @@ class ArbitrageExecutor(ExecutorBase):
         # Calculate the profitability (PnL percentage)
         self._trade_pnl_pct = (normalized_sell_price - self._last_buy_price) / self._last_buy_price
 
+    async def update_trade_close_pnl_pct(self):
+        self._last_buy_close_price, self._last_sell_close_price = await self.get_buy_and_sell_close_prices()
+        if not self._last_buy_close_price or not self._last_sell_close_price:
+            raise Exception("Could not get buy and sell close prices")
+        conversion_rate = await self.get_quote_asset_conversion_rate()
+
+        # Normalize the sell price to the same quote asset as the buy price
+        normalized_sell_price = self._last_buy_close_price * conversion_rate
+        self._trade_close_pnl_pct = (normalized_sell_price - self._last_sell_close_price) / self._last_sell_close_price
+
     async def get_quote_asset_conversion_rate(self) -> Decimal:
         """
         Fetch the conversion rate between the quote assets of the buying and selling markets.
@@ -271,6 +456,9 @@ class ArbitrageExecutor(ExecutorBase):
         """
         # Fetch the conversion rate from the connector
         try:
+            selling_quote, buying_quote = split_hb_trading_pair(self.quote_conversion_pair)
+            if self._are_tokens_interchangeable(selling_quote, buying_quote):
+                return Decimal('1')
             conversion_rate = self.rate_oracle.get_pair_rate(self.quote_conversion_pair)
             return conversion_rate
         except Exception as e:
@@ -287,13 +475,23 @@ class ArbitrageExecutor(ExecutorBase):
         else:
             fee = connector.get_fee(
                 base_currency=asset,
-                quote_currency=asset,
+                quote_currency=trading_pair.split("-")[1],
                 order_type=OrderType.MARKET,
                 order_side=TradeType.BUY if is_buy else TradeType.SELL,
                 amount=order_amount,
                 price=price,
                 is_maker=False
-            )
+            ) if not self.is_perpetual_connector(connector.name) else \
+                connector.get_fee(
+                    base_currency=asset,
+                    quote_currency=trading_pair.split("-")[1],
+                    order_type=OrderType.MARKET,
+                    order_side=TradeType.BUY if is_buy else TradeType.SELL,
+                    amount=order_amount,
+                    price=price,
+                    is_maker=False,
+                    position_action=PositionAction.OPEN
+                )
             return fee.fee_amount_in_token(
                 trading_pair=trading_pair,
                 price=price,
@@ -309,6 +507,12 @@ class ArbitrageExecutor(ExecutorBase):
         elif self.sell_order.order_id == event.order_id:
             self.logger().info("Sell Order Created")
             self.sell_order.order = self.get_in_flight_order(self.selling_market.connector_name, event.order_id)
+        elif self.buy_close_order.order_id == event.order_id:
+            self.logger().info("Buy Close Order Created")
+            self.buy_close_order.order = self.get_in_flight_order(self.buying_market.connector_name, event.order_id)
+        elif self.sell_close_order.order_id == event.order_id:
+            self.logger().info("Sell Close Order Created")
+            self.sell_close_order.order = self.get_in_flight_order(self.selling_market.connector_name, event.order_id)
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         if self.buy_order.order_id == event.order_id:
@@ -317,6 +521,20 @@ class ArbitrageExecutor(ExecutorBase):
         elif self.sell_order.order_id == event.order_id:
             self.place_sell_arbitrage_order()
             self._cumulative_failures += 1
+        elif self.buy_close_order.order_id == event.order_id:
+            self.place_buy_close_arbitrage_order()
+            self._cumulative_failures += 1
+        elif self.sell_close_order.order_id == event.order_id:
+            self.place_sell_close_arbitrage_order()
+            self._cumulative_failures += 1
+
+    def process_funding_payment_event(self, _, market, event: FundingPaymentCompletedEvent):
+        if self.buying_market.connector_name == event.market and \
+                self.buying_market.trading_pair == event.trading_pair:
+            self._funding_payment_profit -= event.funding_rate * self.config.order_amount
+        if self.selling_market.connector_name == event.market and \
+                self.selling_market.trading_pair == event.trading_pair:
+            self._funding_payment_profit += event.funding_rate * self.config.order_amount
 
     def get_custom_info(self) -> Dict:
         return {
@@ -351,7 +569,8 @@ class ArbitrageExecutor(ExecutorBase):
     -------------------------------------------------------------------------------
     """])
             if self.close_type == CloseType.COMPLETED:
-                lines.extend([f"Total Profit (%): {self.net_pnl_pct * 100:.2f} | Total Profit ({quote}): {self.net_pnl_quote:.4f}"])
+                lines.extend([
+                    f"Total Profit (%): {self.net_pnl_pct * 100:.2f} | Total Profit ({quote}): {self.net_pnl_quote:.4f}"])
             return lines
         else:
             msg = ["There was an error while formatting the status for the executor."]
