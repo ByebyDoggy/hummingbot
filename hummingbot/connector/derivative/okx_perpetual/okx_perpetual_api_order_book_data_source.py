@@ -89,7 +89,8 @@ class OkxPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         if not bool(self._trading_rules):
             resp = await self._request_trading_rules_info()
             for rule in resp["data"]:
-                self._trading_rules[rule["instId"]] = float(rule["ctVal"])
+                if rule.get('state') == 'live':
+                    self._trading_rules[rule["instId"]] = float(rule["ctVal"])
         return self._trading_rules
 
     async def _request_trading_rules_info(self) -> Dict[str, Any]:

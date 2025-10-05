@@ -258,6 +258,8 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
                 data["posSide"] = "short" if trade_type is TradeType.BUY else "long"
         else:
             data["posSide"] = "net"
+            if position_action == PositionAction.CLOSE:
+                data["reduceOnly"] = True
 
         exchange_order_id = await self._api_post(
             path_url=CONSTANTS.REST_PLACE_ACTIVE_ORDER[CONSTANTS.ENDPOINT],

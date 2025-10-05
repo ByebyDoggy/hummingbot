@@ -727,8 +727,11 @@ class BitmartPerpetualDerivative(PerpetualDerivativePyBase):
                 self._order_tracker.process_order_update(new_order_update)
 
     async def _trading_pair_position_mode_set(self, mode: PositionMode, trading_pair: str) -> Tuple[bool, str]:
-        # Set only once because at 2025-04-10 bitmart only supports one position mode accross all markets
         msg = ""
+        # 预先定义变量
+        set_position_mode_code = None
+        set_position_mode_data = None
+
         if not self._position_mode_set:
             position_mode = "hedge_mode" if mode == PositionMode.HEDGE else "one_way_mode"
             payload = {
@@ -741,13 +744,15 @@ class BitmartPerpetualDerivative(PerpetualDerivativePyBase):
             )
             set_position_mode_code = set_position_mode.get("code")
             set_position_mode_data = set_position_mode.get("data")
+
             if set_position_mode_data is not None and set_position_mode_code == CONSTANTS.CODE_OK:
                 success = set_position_mode_data.get("position_mode") == position_mode
                 self.logger().info(f"Position mode switched to {mode}.")
                 self._position_mode_set = True
             else:
                 success = False
-                msg = f"Unable to set position mode: Code {set_position_mode_code} - {set_position_mode["message"]}"
+                # 现在set_position_mode_code肯定有值
+                msg = f"Unable to set position mode: Code {set_position_mode_code} - {set_position_mode.get('message', 'Unknown error')}"
         else:
             success = True
             msg = "Position Mode already set."
