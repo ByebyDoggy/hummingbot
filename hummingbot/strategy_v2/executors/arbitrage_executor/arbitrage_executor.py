@@ -251,8 +251,9 @@ class ArbitrageExecutor(PerpetualExecutorBase):
         self.close_type = CloseType.EARLY_STOP
         if self.is_perpetual_connector(self.buying_market.connector_name) and \
                 self.is_perpetual_connector(self.selling_market.connector_name):
-            self.place_sell_close_arbitrage_order()
-            self.place_buy_close_arbitrage_order()
+            if self.buy_order.order and self.sell_order.order:
+                self.place_buy_close_arbitrage_order()
+                self.place_sell_close_arbitrage_order()
         self.stop()
 
     def __get_current_profit__(self):
