@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Dict, Union
 
 from hummingbot.connector.utils import split_hb_trading_pair
@@ -228,12 +228,22 @@ class ArbitrageExecutor(PerpetualExecutorBase):
         return await self.connectors[exchange].get_quote_price(trading_pair, is_buy, order_amount)
 
     async def control_task(self):
+        try:
+            await self.update_trade_close_pnl_pct()
+        except:
+            return
         if self.status == RunnableStatus.RUNNING:
             try:
                 await self.update_trade_pnl_pct()
-                await self.update_trade_close_pnl_pct()
                 await self.update_tx_cost()
                 funding_rate_profit = self.get_funding_rate_profit()
+                # 安全检查，避免除零或 NaN
+                if not self.order_amount or self.order_amount == Decimal("0"):
+                    self.logger().warning("Order amount is zero, skipping profitability calculation.")
+                    return
+
+                if any(x.is_nan() for x in [self._trade_pnl_pct, self._last_tx_cost, funding_rate_profit]):
+                    return
                 self._current_profitability = (self._trade_pnl_pct * self.order_amount - self._last_tx_cost) \
                                               / self.order_amount + funding_rate_profit
                 if self._current_profitability > self.min_profitability:
@@ -262,6 +272,8 @@ class ArbitrageExecutor(PerpetualExecutorBase):
         """
         sell_quote_amount = self.sell_order.order.executed_amount_base * self.sell_order.average_executed_price
         buy_quote_amount = self.buy_order.order.executed_amount_base * self.buy_order.average_executed_price
+        if any(x.is_nan() for x in [sell_quote_amount, buy_quote_amount, self.cum_fees_quote, self._funding_payment_profit, self._trade_close_pnl_pct]):
+            return Decimal("0")
         return sell_quote_amount - buy_quote_amount - self.cum_fees_quote + self._funding_payment_profit \
             + self.config.order_amount * self._trade_close_pnl_pct
 
@@ -289,7 +301,7 @@ class ArbitrageExecutor(PerpetualExecutorBase):
                     current_profit = self.__get_current_profit__()
                     if (current_profit + estimate_next_funding_profit) < \
                             self.config.min_profitability * Decimal('0.5') and \
-                            current_profit > self.config.min_profitability * 0.5:
+                            current_profit > self.config.min_profitability * Decimal('0.5'):
                         self._arbitrage_close_flag = True
                     if current_profit > self.config.min_profitability * Decimal('0.9'):
                         self._arbitrage_close_flag = True
@@ -360,7 +372,6 @@ class ArbitrageExecutor(PerpetualExecutorBase):
 
     async def update_tx_cost(self):
         base, quote = split_hb_trading_pair(trading_pair=self.buying_market.trading_pair)
-        # TODO: also due the fact that we don't have a good rate oracle source we have to use a fixed token
         base_without_wrapped = base[1:] if base.startswith("W") else base
         buy_fee = await self.get_tx_cost_in_asset(
             exchange=self.buying_market.connector_name,
@@ -374,7 +385,8 @@ class ArbitrageExecutor(PerpetualExecutorBase):
             trading_pair=self.buying_market.trading_pair,
             is_buy=False,
             order_amount=self.order_amount,
-            asset=base_without_wrapped
+            asset=base_without_wrapped,
+            is_open=False
         )
         sell_fee = await self.get_tx_cost_in_asset(
             exchange=self.selling_market.connector_name,
@@ -387,11 +399,13 @@ class ArbitrageExecutor(PerpetualExecutorBase):
             trading_pair=self.selling_market.trading_pair,
             is_buy=True,
             order_amount=self.order_amount,
-            asset=base_without_wrapped)
-        self._last_buy_fee = buy_fee
-        self._last_sell_fee = sell_fee
-        self._last_buy_close_fee = buy_close_fee
-        self._last_sell_close_fee = sell_close_fee
+            asset=base_without_wrapped,
+            is_open=False
+        )
+        self._last_buy_fee = buy_fee if not buy_fee.is_nan() else Decimal("0")
+        self._last_sell_fee = sell_fee if not sell_fee.is_nan() else Decimal("0")
+        self._last_buy_close_fee = buy_close_fee if not buy_close_fee.is_nan() else Decimal("0")
+        self._last_sell_close_fee = sell_close_fee if not sell_close_fee.is_nan() else Decimal("0")
         self._last_tx_cost = self._last_buy_fee + self._last_sell_fee + \
                              self._last_buy_close_fee + self._last_sell_close_fee
 
@@ -436,7 +450,6 @@ class ArbitrageExecutor(PerpetualExecutorBase):
 
         # Normalize the sell price to the same quote asset as the buy price
         normalized_sell_price = self._last_sell_price * conversion_rate
-
         # Calculate the profitability (PnL percentage)
         self._trade_pnl_pct = (normalized_sell_price - self._last_buy_price) / self._last_buy_price
 
@@ -467,7 +480,7 @@ class ArbitrageExecutor(PerpetualExecutorBase):
             raise
 
     async def get_tx_cost_in_asset(self, exchange: str, trading_pair: str, is_buy: bool, order_amount: Decimal,
-                                   asset: str):
+                                   asset: str, is_open: bool = True):
         connector = self.connectors[exchange]
         price = await self.get_resulting_price_for_amount(exchange, trading_pair, is_buy, order_amount)
         if self.is_amm_connector(exchange=exchange):
@@ -491,7 +504,7 @@ class ArbitrageExecutor(PerpetualExecutorBase):
                     amount=order_amount,
                     price=price,
                     is_maker=False,
-                    position_action=PositionAction.OPEN
+                    position_action=PositionAction.OPEN if is_open else PositionAction.CLOSE
                 )
             return fee.fee_amount_in_token(
                 trading_pair=trading_pair,
@@ -559,21 +572,66 @@ class ArbitrageExecutor(PerpetualExecutorBase):
 
     def to_format_status(self):
         lines = []
-        if self._last_buy_price and self._last_sell_price:
-            trade_pnl_pct = (self._last_sell_price - self._last_buy_price) / self._last_buy_price
-            tx_cost_pct = self._last_tx_cost / self.order_amount
+        try:
+            # 安全读取字段，保证类型正确
+            buy_price = self._last_buy_price or Decimal("0")
+            sell_price = self._last_sell_price or Decimal("0")
+            tx_cost = self._last_tx_cost or Decimal("0")
+            order_amount = self.order_amount or Decimal("0")
+
+            # 检查无效数据
+            if any([
+                x.is_nan() if isinstance(x, Decimal) else False
+                for x in [buy_price, sell_price, tx_cost, order_amount]
+            ]):
+                self.logger().warning(f"Detected NaN in status values: "
+                                      f"buy={buy_price}, sell={sell_price}, tx_cost={tx_cost}, order_amount={order_amount}")
+                return ["Executor status unavailable due to NaN values."]
+
+            # 防止除零
+            if buy_price <= 0 or order_amount <= 0:
+                self.logger().warning(f"Invalid prices/order_amount in to_format_status: "
+                                      f"buy={buy_price}, sell={sell_price}, order_amount={order_amount}")
+                return ["Executor status unavailable (invalid buy/sell/order amount)."]
+
+            # 计算 PnL
+            try:
+                trade_pnl_pct = (sell_price - buy_price) / buy_price
+            except InvalidOperation:
+                trade_pnl_pct = Decimal("0")
+
+            try:
+                tx_cost_pct = tx_cost / order_amount
+            except (InvalidOperation, ZeroDivisionError):
+                tx_cost_pct = Decimal("0")
+
             base, quote = split_hb_trading_pair(trading_pair=self.buying_market.trading_pair)
+
             lines.extend([f"""
-    Arbitrage Status: {self.status} | Close Type: {self.close_type}
-    - BUY: {self.buying_market.connector_name}:{self.buying_market.trading_pair}  --> SELL: {self.selling_market.connector_name}:{self.selling_market.trading_pair} | Amount: {self.order_amount:.2f}
-    - Trade PnL (%): {trade_pnl_pct * 100:.2f} % | TX Cost (%): -{tx_cost_pct * 100:.2f} % | Net PnL (%): {(trade_pnl_pct - tx_cost_pct) * 100:.2f} %
-    -------------------------------------------------------------------------------
-    """])
+        Arbitrage Status: {self.status} | Close Type: {self.close_type}
+        - BUY: {self.buying_market.connector_name}:{self.buying_market.trading_pair}  
+          --> SELL: {self.selling_market.connector_name}:{self.selling_market.trading_pair}
+          | Amount: {order_amount:.2f}
+        - Trade PnL (%): {trade_pnl_pct * 100:.2f} %
+          | TX Cost (%): -{tx_cost_pct * 100:.2f} %
+          | Net PnL (%): {(trade_pnl_pct - tx_cost_pct) * 100:.2f} %
+        -------------------------------------------------------------------------------
+        """])
+
+            # 输出已完成时的净利润
             if self.close_type == CloseType.COMPLETED:
-                lines.extend([
-                    f"Total Profit (%): {self.net_pnl_pct * 100:.2f} | Total Profit ({quote}): {self.net_pnl_quote:.4f}"])
+                net_pnl_pct = getattr(self, "net_pnl_pct", Decimal("0")) or Decimal("0")
+                net_pnl_quote = getattr(self, "net_pnl_quote", Decimal("0")) or Decimal("0")
+
+                if any(x.is_nan() for x in [net_pnl_pct, net_pnl_quote]):
+                    net_pnl_pct, net_pnl_quote = Decimal("0"), Decimal("0")
+
+                lines.append(
+                    f"Total Profit (%): {net_pnl_pct * 100:.2f} | Total Profit ({quote}): {net_pnl_quote:.4f}"
+                )
+
             return lines
-        else:
-            msg = ["There was an error while formatting the status for the executor."]
-            self.logger().warning(msg)
-            return lines.extend(msg)
+
+        except Exception as e:
+            self.logger().error(f"Error formatting executor status: {e}")
+            return ["Executor status formatting failed due to unexpected error."]
