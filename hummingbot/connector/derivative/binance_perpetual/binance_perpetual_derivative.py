@@ -41,6 +41,9 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
     LONG_POLL_INTERVAL = 120.0
 
+    _income_cache: Dict[str, Any] = {"timestamp": 0, "data": []}  # 全局缓存
+    _income_cache_lock = asyncio.Lock()  # 防止并发更新冲突
+
     def __init__(
             self,
             balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
@@ -775,31 +778,56 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
         return success, msg
 
     async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[int, Decimal, Decimal]:
+        """
+        优化版：使用缓存的 funding fee 数据，只在30秒后才重新请求。
+        """
         exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-        payment_response = await self._api_get(
-            path_url=CONSTANTS.GET_INCOME_HISTORY_URL,
-            params={
-                "symbol": exchange_symbol,
-                "incomeType": "FUNDING_FEE",
-            },
-            is_auth_required=True,
-        )
-        funding_info_response = await self._api_get(
-            path_url=CONSTANTS.MARK_PRICE_URL,
-            params={
-                "symbol": exchange_symbol,
-            },
-        )
-        sorted_payment_response = sorted(payment_response, key=lambda a: a.get('time', 0), reverse=True)
-        if len(sorted_payment_response) < 1:
-            timestamp, funding_rate, payment = 0, Decimal("-1"), Decimal("-1")
-            return timestamp, funding_rate, payment
-        funding_payment = sorted_payment_response[0]
-        _payment = Decimal(funding_payment["income"])
-        funding_rate = Decimal(funding_info_response["lastFundingRate"])
-        timestamp = funding_payment["time"]
+
+        # === Step 1: 尝试使用缓存 ===
+        now = time.time()
+        async with self._income_cache_lock:
+            if now - self._income_cache["timestamp"] > 30:  # 缓存过期，重新请求
+                try:
+                    response = await self._api_get(
+                        path_url=CONSTANTS.GET_INCOME_HISTORY_URL,
+                        params={"incomeType": "FUNDING_FEE"},
+                        is_auth_required=True,
+                    )
+                    self._income_cache["timestamp"] = now
+                    self._income_cache["data"] = response or []
+                    self.logger().debug(f"Updated funding fee cache with {len(response)} records.")
+                except Exception as e:
+                    self.logger().error(f"Failed to refresh funding fee cache: {e}")
+
+        # === Step 2: 从缓存中查找目标交易对 ===
+        payments: List[Dict[str, Any]] = [
+            p for p in self._income_cache["data"]
+            if p.get("symbol") == exchange_symbol
+        ]
+
+        if not payments:
+            # 没有记录，返回默认值
+            return 0, Decimal("-1"), Decimal("-1")
+
+        # 按时间排序，取最新的一条
+        latest_payment = max(payments, key=lambda x: x.get("time", 0))
+        _payment = Decimal(latest_payment["income"])
+        timestamp = latest_payment["time"]
+
+        # === Step 3: 获取 funding rate（实时） ===
+        try:
+            funding_info_response = await self._api_get(
+                path_url=CONSTANTS.MARK_PRICE_URL,
+                params={"symbol": exchange_symbol},
+            )
+            funding_rate = Decimal(funding_info_response["lastFundingRate"])
+        except Exception:
+            funding_rate = Decimal("-1")
+
+        # === Step 4: 构造结果 ===
         if _payment != Decimal("0"):
             payment = _payment
         else:
             timestamp, funding_rate, payment = 0, Decimal("-1"), Decimal("-1")
+
         return timestamp, funding_rate, payment

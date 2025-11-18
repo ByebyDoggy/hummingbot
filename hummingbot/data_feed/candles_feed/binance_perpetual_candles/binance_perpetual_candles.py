@@ -1,10 +1,15 @@
+import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.data_feed.candles_feed.binance_perpetual_candles import constants as CONSTANTS
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.logger import HummingbotLogger
+
+_health_check_cache = {"time": 0, "status": NetworkStatus.NOT_CONNECTED}
+_health_check_lock = asyncio.Lock()
 
 
 class BinancePerpetualCandles(CandlesBase):
@@ -55,11 +60,29 @@ class BinancePerpetualCandles(CandlesBase):
     def intervals(self):
         return CONSTANTS.INTERVALS
 
+    # async def check_network(self) -> NetworkStatus:
+    #     rest_assistant = await self._api_factory.get_rest_assistant()
+    #     await rest_assistant.execute_request(url=self.health_check_url,
+    #                                          throttler_limit_id=CONSTANTS.HEALTH_CHECK_ENDPOINT)
+    #     return NetworkStatus.CONNECTED
+
     async def check_network(self) -> NetworkStatus:
-        rest_assistant = await self._api_factory.get_rest_assistant()
-        await rest_assistant.execute_request(url=self.health_check_url,
-                                             throttler_limit_id=CONSTANTS.HEALTH_CHECK_ENDPOINT)
-        return NetworkStatus.CONNECTED
+        interval = 60  # 最少 60 秒发一次请求
+        async with _health_check_lock:
+            now = int(time.time())
+            if now - _health_check_cache["time"] > interval:
+                try:
+                    rest_assistant = await self._api_factory.get_rest_assistant()
+                    await rest_assistant.execute_request(
+                        url=self.health_check_url,
+                        throttler_limit_id=CONSTANTS.HEALTH_CHECK_ENDPOINT
+                    )
+                    _health_check_cache["status"] = NetworkStatus.CONNECTED
+                except Exception:
+                    _health_check_cache["status"] = NetworkStatus.NOT_CONNECTED
+                finally:
+                    _health_check_cache["time"] = now
+        return _health_check_cache["status"]
 
     def get_exchange_trading_pair(self, trading_pair):
         return trading_pair.replace("-", "")
@@ -99,6 +122,8 @@ class BinancePerpetualCandles(CandlesBase):
         ]
 
     def ws_subscription_payload(self):
+        if self.interval == CONSTANTS.INTERVALS.get('1s'):
+            raise ValueError("1s interval candles subscriptions are not supported for Binance Perpetual.")
         candle_params = [f"{self._ex_trading_pair.lower()}@kline_{self.interval}"]
         payload = {
             "method": "SUBSCRIBE",

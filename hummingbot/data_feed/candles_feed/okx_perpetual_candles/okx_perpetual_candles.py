@@ -1,10 +1,15 @@
+import asyncio
 import logging
+import time
 from typing import List, Optional
 
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.okx_perpetual_candles import constants as CONSTANTS
 from hummingbot.logger import HummingbotLogger
+
+_health_check_cache = {"time": 0, "status": NetworkStatus.NOT_CONNECTED}
+_health_check_lock = asyncio.Lock()
 
 
 class OKXPerpetualCandles(CandlesBase):
@@ -55,11 +60,29 @@ class OKXPerpetualCandles(CandlesBase):
     def intervals(self):
         return CONSTANTS.INTERVALS
 
+    # async def check_network(self) -> NetworkStatus:
+    #     rest_assistant = await self._api_factory.get_rest_assistant()
+    #     await rest_assistant.execute_request(url=self.health_check_url,
+    #                                          throttler_limit_id=CONSTANTS.HEALTH_CHECK_ENDPOINT)
+    #     return NetworkStatus.CONNECTED
+
     async def check_network(self) -> NetworkStatus:
-        rest_assistant = await self._api_factory.get_rest_assistant()
-        await rest_assistant.execute_request(url=self.health_check_url,
-                                             throttler_limit_id=CONSTANTS.HEALTH_CHECK_ENDPOINT)
-        return NetworkStatus.CONNECTED
+        interval = 60  # 最少 60 秒发一次请求
+        async with _health_check_lock:
+            now = int(time.time())
+            if now - _health_check_cache["time"] > interval:
+                try:
+                    rest_assistant = await self._api_factory.get_rest_assistant()
+                    await rest_assistant.execute_request(
+                        url=self.health_check_url,
+                        throttler_limit_id=CONSTANTS.HEALTH_CHECK_ENDPOINT
+                    )
+                    _health_check_cache["status"] = NetworkStatus.CONNECTED
+                except Exception:
+                    _health_check_cache["status"] = NetworkStatus.NOT_CONNECTED
+                finally:
+                    _health_check_cache["time"] = now
+        return _health_check_cache["status"]
 
     def get_exchange_trading_pair(self, trading_pair):
         return f"{trading_pair}-SWAP"
@@ -85,11 +108,12 @@ class OKXPerpetualCandles(CandlesBase):
 
     def _parse_rest_candles(self, data: dict, end_time: Optional[int] = None) -> List[List[float]]:
         return [
-            [
-                self.ensure_timestamp_in_seconds(row[0]), row[1], row[2], row[3], row[4], row[6], row[7], 0., 0., 0.
-            ]
-            for row in data["data"]
-        ][::-1]
+                   [
+                       self.ensure_timestamp_in_seconds(row[0]), row[1], row[2], row[3], row[4], row[6], row[7], 0., 0.,
+                       0.
+                   ]
+                   for row in data["data"]
+               ][::-1]
 
     def ws_subscription_payload(self):
         candle_args = [{"channel": f"candle{CONSTANTS.INTERVALS[self.interval]}", "instId": self._ex_trading_pair}]

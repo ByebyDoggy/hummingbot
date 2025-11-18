@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -58,6 +59,9 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
         self._domain = domain
         self._last_trade_history_timestamp = None
         self._contract_sizes = {}
+
+        self._bills_cache: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}  # 缓存结构：{交易对: (数据, 缓存时间戳)}
+        self._bills_lock: asyncio.Lock = asyncio.Lock()  # 异步锁，保证缓存操作线程安全
 
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
@@ -812,37 +816,71 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[int, Decimal, Decimal]:
         """
-        Fetches the last funding fee/payment for the given trading pair.
-
-        Type 8 represents funding fee/payment. Subtypes 173 and 174 represent funding fee expense and
-        income respectively.
-
-        Funding Fee expense (subType = 173)
-
-        You may refer to "pnl" for the fee payment
+        Fetches the last funding fee/payment for the given trading pair with 10s cache (storing all currencies at once) and async lock.
         """
-        params = {
-            "instType": "SWAP",
-            "type": 8
-        }
-        raw_response: Dict[str, Any] = await self._api_get(
-            path_url=CONSTANTS.REST_BILLS_DETAILS[CONSTANTS.ENDPOINT],
-            params=params,
-            is_auth_required=True,
-            trading_pair=trading_pair,
-        )
-        data: List[Dict[str, Any]] = raw_response.get("data")
+        # 定义缓存过期时间（10秒）
+        CACHE_EXPIRE_SECONDS = 10
         ex_trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair)
+
+        # 异步锁：确保缓存读写操作的原子性，防止并发冲突
+        async with self._bills_lock:
+            # 检查缓存是否存在且未过期（缓存键改为固定值，存储所有币种数据）
+            current_time = datetime.now().timestamp()
+            cached_data = self._bills_cache.get("all_bills")  # 固定键存储全部数据
+
+            if cached_data:
+                all_bills, cache_timestamp = cached_data
+                # 若缓存未过期，直接使用缓存的全部数据
+                if current_time - cache_timestamp < CACHE_EXPIRE_SECONDS:
+                    data = all_bills
+                else:
+                    # 缓存过期，标记为需要更新
+                    data = None
+            else:
+                # 无缓存，需要从接口获取
+                data = None
+
+        # 缓存未命中或已过期：从接口获取数据（无需trading_pair参数）并更新缓存
+        if data is None:
+            params = {
+                "instType": "SWAP",
+                "type": 8  # 8代表资金费用相关记录
+            }
+            # 调用接口获取原始数据（移除trading_pair参数，因为接口不需要）
+            raw_response: Dict[str, Any] = await self._api_get(
+                path_url=CONSTANTS.REST_BILLS_DETAILS[CONSTANTS.ENDPOINT],
+                params=params,
+                is_auth_required=True
+                # 移除trading_pair参数，避免不必要的传递
+            )
+            # 提取所有币种的账单数据（接口返回的data是全量列表）
+            data: List[Dict[str, Any]] = raw_response.get("data", [])
+
+            # 再次加锁，更新缓存（存储全量数据，供所有交易对共享）
+            async with self._bills_lock:
+                self._bills_cache["all_bills"] = (data, datetime.now().timestamp())  # 固定键存储
+
+        # 从全量数据中过滤当前交易对的记录
         trading_pair_data = [bill for bill in data if bill["instId"] == ex_trading_pair]
         payment = Decimal("-1")
+
         if not trading_pair_data:
-            # An empty funding fee/payment is retrieved.
+            # 无当前交易对的数据时返回默认值
             timestamp, funding_rate = 0, Decimal("-1")
         else:
-            timestamp: int = int(trading_pair_data[0]["ts"])
-            funding_rate: Decimal = self._orderbook_ds._last_rate if self._orderbook_ds._last_rate is not None else Decimal(str(-1))
-            if trading_pair_data[0].get("type") == CONSTANTS.FUNDING_PAYMENT_TYPE:
-                payment: Decimal = Decimal(str(trading_pair_data[0]["pnl"]))
+            # 按时间戳倒序排序，确保取到最新的记录（避免接口返回顺序问题）
+            trading_pair_data.sort(key=lambda x: int(x["ts"]), reverse=True)
+            latest_bill = trading_pair_data[0]
+
+            timestamp: int = int(latest_bill["ts"])
+            # 获取最新资金费率（优先用缓存的_last_rate，否则默认-1）
+            funding_rate: Decimal = (self._orderbook_ds._last_rate
+                                     if self._orderbook_ds._last_rate is not None
+                                     else Decimal("-1"))
+            # 检查是否为资金费用记录（根据type和subType判断，确保准确性）
+            if (latest_bill.get("type") == 8 and  # 主类型为资金费用
+                    latest_bill.get("subType") in [173, 174]):  # 子类型173=支出，174=收入
+                payment: Decimal = Decimal(str(latest_bill["pnl"]))
 
         return timestamp, funding_rate, payment
 
