@@ -271,8 +271,9 @@ class OkxPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             await ws.send(subscribe_trades_request)
             await ws.send(subscribe_orderbook_request)
             await ws.send(subscribe_instruments_request)
-            await ws.send(subscribe_mark_price_request)
-            await ws.send(subscribe_index_price_request)
+            # 暂时不需要监听mark_price和index_price
+            # await ws.send(subscribe_mark_price_request)
+            # await ws.send(subscribe_index_price_request)
             self.logger().info("Subscribed to public order book, trade and funding info channels...")
         except asyncio.CancelledError:
             raise
