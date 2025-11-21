@@ -1,3 +1,4 @@
+import time
 from decimal import Decimal
 from typing import Union
 
@@ -82,6 +83,18 @@ class ExecutorSimulation(BaseModel):
 
 class ExecutorSimulatorBase:
     """Base class for trading simulators."""
+
+    @staticmethod
+    def pre_check(config):
+        if hasattr(config, "timestamp"):
+            tl_timestamp = config.timestamp
+            if tl_timestamp-time.time() > -3600:
+                raise ValueError("Timestamp should be in the past 3600 seconds ago,"
+                                 "consider set timestamp in backtest mode")
+        else:
+            print("No timestamp provided, using current time")
+
+
 
     def simulate(self, df: pd.DataFrame, config, trade_cost: float) -> ExecutorSimulation:
         """Simulates trading based on provided configuration and market data."""

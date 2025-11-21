@@ -8,13 +8,18 @@ from hummingbot.strategy_v2.models.executors import CloseType
 
 class PositionExecutorSimulator(ExecutorSimulatorBase):
     def simulate(self, df: pd.DataFrame, config: PositionExecutorConfig, trade_cost: float) -> ExecutorSimulation:
+        self.pre_check(config)
         if config.triple_barrier_config.open_order_type.is_limit_type():
-            entry_condition = (df['close'] <= config.entry_price) if config.side == TradeType.BUY else (df['close'] >= config.entry_price)
+            if config.entry_price:
+                entry_condition = (df['low'] <= config.entry_price) if config.side == TradeType.BUY else (
+                            df['high'] >= config.entry_price)
+            else:
+                # 任意K线都可以触发
+                entry_condition = df.index >= config.timestamp
             start_timestamp = df[entry_condition]['timestamp'].min()
         else:
             start_timestamp = df['timestamp'].min()
         last_timestamp = df['timestamp'].max()
-
         # Set up barriers
         tp = float(config.triple_barrier_config.take_profit) if config.triple_barrier_config.take_profit else None
         trailing_sl_trigger_pct = None
@@ -27,7 +32,6 @@ class PositionExecutorSimulator(ExecutorSimulatorBase):
 
         # Filter dataframe based on the conditions
         df_filtered = df[:tl_timestamp].copy()
-
         df_filtered['net_pnl_pct'] = 0.0
         df_filtered['net_pnl_quote'] = 0.0
         df_filtered['cum_fees_quote'] = 0.0
@@ -78,7 +82,7 @@ class PositionExecutorSimulator(ExecutorSimulatorBase):
         # Set the final state of the DataFrame
         df_filtered = df_filtered[:close_timestamp]
         df_filtered.loc[df_filtered.index[-1], "filled_amount_quote"] = df_filtered["filled_amount_quote"].iloc[-1] * 2
-
+        # print(df_filtered)
         # Construct and return ExecutorSimulation object
         simulation = ExecutorSimulation(
             config=config,

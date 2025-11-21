@@ -1,0 +1,35 @@
+# ---------- Dockerfile.base ----------
+FROM continuumio/miniconda3:latest AS base
+
+LABEL maintainer="Hummingbot Optimized Build <dev@hummingbot.org>"
+
+# Install basic build tools
+RUN apt-get update && \
+    apt-get install -y sudo libusb-1.0 gcc g++ python3-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /home/hummingbot
+
+# Copy environment file and create Conda environment
+COPY setup/environment.yml /tmp/environment.yml
+RUN conda config --add channels conda-forge && \
+    conda config --set channel_priority strict && \
+    conda env create -f /tmp/environment.yml && \
+    conda clean -afy && \
+    rm /tmp/environment.yml
+
+# Activate environment by default
+SHELL ["/bin/bash", "-lc"]
+RUN echo "conda activate hummingbot" >> ~/.bashrc
+
+# Install pip dependencies
+COPY setup/pip_packages.txt /tmp/pip_packages.txt
+RUN conda activate hummingbot && \
+    pip install --no-deps --no-cache-dir -r /tmp/pip_packages.txt && \
+    rm /tmp/pip_packages.txt
+
+# Save environment info for caching comparison
+RUN conda env export -n hummingbot > /home/hummingbot/conda_env.lock
+
+# The base image only contains dependencies
+CMD ["/bin/bash"]
