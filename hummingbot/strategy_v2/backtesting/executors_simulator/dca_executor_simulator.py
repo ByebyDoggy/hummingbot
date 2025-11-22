@@ -42,6 +42,7 @@ class DCAExecutorSimulator(ExecutorSimulatorBase):
             is_last_order = i == len(config.prices) - 1
             price = config.prices[i]
             amount = config.amounts_quote[i]
+            # 计算当前level持仓均价
             break_even_price = DCAExecutorSimulator.break_even_price_at_index(config.prices, config.amounts_quote, i) if i > 0 else price
 
             entry_condition = (df_filtered['close'] <= price) if config.side == TradeType.BUY else (df_filtered['close'] >= price)
@@ -77,21 +78,25 @@ class DCAExecutorSimulator(ExecutorSimulatorBase):
                 trailing_sl_timestamp = returns_df[trailing_stop_condition]['timestamp'].min() if trailing_stop_condition is not None else None
 
             if config.take_profit:
+                print(returns_df)
                 take_profit_price = break_even_price * (1 + config.take_profit * side_multiplier)
                 take_profit_condition = returns_df['close'] >= take_profit_price if config.side == TradeType.BUY else returns_df['close'] <= take_profit_price
                 take_profit_timestamp = returns_df[take_profit_condition]['timestamp'].min()
+                print(f"take_profit_timestamp: {take_profit_timestamp}")
+
 
             if is_last_order and config.stop_loss:
                 stop_loss_price = break_even_price * (1 - config.stop_loss * side_multiplier)
                 stop_loss_condition = returns_df['low'] <= stop_loss_price if config.side == TradeType.BUY else returns_df['high'] >= stop_loss_price
                 stop_loss_timestamp = returns_df[stop_loss_condition]['timestamp'].min()
             else:
-                next_order_condition = returns_df['close'] <= config.prices[i + 1] if config.side == TradeType.BUY else returns_df['close'] >= config.prices[i + 1]
-                next_order_timestamp = returns_df[next_order_condition]['timestamp'].min()
+                if not is_last_order:
+                    next_order_condition = returns_df['close'] <= config.prices[
+                        i + 1] if config.side == TradeType.BUY else returns_df['close'] >= config.prices[i + 1]
+                    next_order_timestamp = returns_df[next_order_condition]['timestamp'].min()
 
             close_timestamp = min([timestamp for timestamp in [take_profit_timestamp, stop_loss_timestamp,
                                                                trailing_sl_timestamp, last_timestamp, next_order_timestamp] if not pd.isna(timestamp)])
-
             if close_timestamp == take_profit_timestamp:
                 close_type = CloseType.TAKE_PROFIT
             elif close_timestamp == stop_loss_timestamp:
@@ -120,8 +125,8 @@ class DCAExecutorSimulator(ExecutorSimulatorBase):
             return ExecutorSimulation(config=config, executor_simulation=df_filtered, close_type=CloseType.TIME_LIMIT)
 
         close_type = None
-
         for i, dca_stage in enumerate(potential_dca_stages):
+            entry_timestamp = dca_stage['entry_timestamp']
             if dca_stage['close_type'] is None:
                 df_filtered.loc[entry_timestamp:, f'filled_amount_quote_{i}'] = dca_stage['amount']
                 df_filtered.loc[entry_timestamp:, f'net_pnl_quote_{i}'] = dca_stage['cumulative_returns'] * dca_stage['amount']
@@ -133,17 +138,14 @@ class DCAExecutorSimulator(ExecutorSimulatorBase):
                 close_type = dca_stage['close_type']
                 last_timestamp = dca_stage['close_timestamp']
                 break
-
         df_filtered = df_filtered[:last_timestamp].copy()
         df_filtered['filled_amount_quote'] = sum([df_filtered[f'filled_amount_quote_{i}'] for i in range(len(potential_dca_stages))])
         df_filtered['net_pnl_quote'] = sum([df_filtered[f'net_pnl_quote_{i}'] for i in range(len(potential_dca_stages))])
         df_filtered['cum_fees_quote'] = trade_cost * df_filtered['filled_amount_quote']
         df_filtered.loc[df_filtered["filled_amount_quote"] > 0, "net_pnl_pct"] = df_filtered["net_pnl_quote"] / df_filtered["filled_amount_quote"]
-        df_filtered.loc[df_filtered.index[-1], "filled_amount_quote"] = df_filtered["filled_amount_quote"].iloc[-1] * 2
-
+        df_filtered.loc[df_filtered.index[-1], "filled_amount_quote"] = df_filtered["filled_amount_quote"].iloc[-1]
         if close_type is None:
             close_type = CloseType.FAILED
-
         # Construct and return ExecutorSimulation object
         simulation = ExecutorSimulation(
             config=config,
