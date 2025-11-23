@@ -85,6 +85,7 @@ def main():
         "web3",
         "xrpl-py>=4.1.0",
         "PyYaml>=0.2.5",
+        "ccxt",
     ]
 
     cython_kwargs = {
@@ -116,10 +117,10 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "build_ext" and is_posix:
         sys.argv.append(f"--parallel={cpu_count}")
 
-    setup(name="hummingbot",
+    setup(name="hummingbot_byebyedoggy",
           version=version,
           description="Hummingbot",
-          url="https://github.com/hummingbot/hummingbot",
+          url="https://github.com/byebyedoggy/hummingbot",
           author="Hummingbot Foundation",
           author_email="dev@hummingbot.org",
           license="Apache 2.0",
