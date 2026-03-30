@@ -1,0 +1,68 @@
+# ---------- Dockerfile.base.proxy ----------
+# This version uses proxy for all package installations
+FROM continuumio/miniconda3:latest AS base
+
+LABEL maintainer="Hummingbot Optimized Build <dev@hummingbot.org>"
+
+# Set proxy environment variables for all package installations
+ENV http_proxy=http://host.docker.internal:7890
+ENV https_proxy=http://host.docker.internal:7890
+ENV HTTP_PROXY=http://host.docker.internal:7890
+ENV HTTPS_PROXY=http://host.docker.internal:7890
+
+# Update package lists
+RUN apt-get update
+
+# Install basic build tools with retry
+RUN apt-get install -y sudo libusb-1.0 gcc g++ python3-dev || \
+    (apt-get update && apt-get install -y sudo libusb-1.0 gcc g++ python3-dev) || \
+    (apt-get update && apt-get install -y --fix-missing sudo libusb-1.0 gcc g++ python3-dev)
+
+# Clean up
+RUN rm -rf /var/lib/apt/lists/*
+
+WORKDIR /home/hummingbot
+
+# Copy environment file and create Conda environment
+COPY setup/environment.yml /tmp/environment.yml
+RUN conda config --add channels conda-forge && \
+    conda config --set channel_priority strict && \
+    conda env create -f /tmp/environment.yml && \
+    conda clean -afy && \
+    rm /tmp/environment.yml
+
+# Activate environment by default
+SHELL ["/bin/bash", "-lc"]
+RUN echo "conda activate hummingbot" >> ~/.bashrc
+
+# Install pip dependencies
+COPY setup/pip_packages.txt /tmp/pip_packages.txt
+RUN conda activate hummingbot && \
+    pip install --no-deps --no-cache-dir -r /tmp/pip_packages.txt && \
+    rm /tmp/pip_packages.txt
+
+# Save environment info for caching comparison
+RUN conda env export -n hummingbot > /home/hummingbot/conda_env.lock
+
+# Copy project files for C compilation
+COPY bin/ bin/
+COPY hummingbot/ hummingbot/
+COPY scripts/ scripts/
+COPY controllers/ controllers/
+COPY setup.py .
+COPY LICENSE .
+COPY README.md .
+
+# Build Cython extensions (C compilation)
+RUN python3 setup.py build_ext --inplace -j 8 && \
+    rm -rf build/ && \
+    find . -type f -name "*.cpp" -delete
+
+# Clear proxy environment variables after all installations
+ENV http_proxy=
+ENV https_proxy=
+ENV HTTP_PROXY=
+ENV HTTPS_PROXY=
+
+# The base image contains dependencies and compiled C extensions
+CMD ["/bin/bash"]

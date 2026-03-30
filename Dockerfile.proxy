@@ -1,0 +1,45 @@
+# ---------- Dockerfile.proxy ----------
+# This version uses proxy for all package installations
+# Build final image using the base image with compiled C extensions
+FROM hummingbot-base:latest AS release
+
+# Dockerfile author / maintainer
+LABEL maintainer="Fede Cardoso @dardonacci <federico@hummingbot.org>"
+
+# Build arguments
+ARG BRANCH=""
+ARG COMMIT=""
+ARG BUILD_DATE=""
+LABEL branch=${BRANCH}
+LABEL commit=${COMMIT}
+LABEL date=${BUILD_DATE}
+
+# Set ENV variables
+ENV COMMIT_SHA=${COMMIT}
+ENV COMMIT_BRANCH=${BRANCH}
+ENV BUILD_DATE=${BUILD_DATE}
+
+ENV INSTALLATION_TYPE=docker
+
+# Create mount points
+RUN mkdir -p /home/hummingbot/conf /home/hummingbot/conf/connectors /home/hummingbot/conf/strategies /home/hummingbot/conf/controllers /home/hummingbot/conf/scripts /home/hummingbot/logs /home/hummingbot/data /home/hummingbot/certs /home/hummingbot/scripts /home/hummingbot/controllers
+
+WORKDIR /home/hummingbot
+
+# Copy only Python files to preserve compiled .so files from base image
+# Use find to copy only .py files, preserving directory structure
+COPY bin/*.py bin/
+COPY scripts/*.py scripts/
+COPY controllers/*.py controllers/
+COPY setup.py .
+COPY LICENSE .
+COPY README.md .
+
+# Copy hummingbot Python files recursively (preserving .so files)
+RUN find /home/hummingbot/hummingbot -name "*.pyx" -delete
+
+# Setting bash as default shell because we have .bashrc with customized PATH (setting SHELL affects RUN, CMD and ENTRYPOINT, but not manual commands e.g. `docker run image COMMAND`!)
+SHELL [ "/bin/bash", "-lc" ]
+
+# Set the default command to run when starting the container
+CMD conda activate hummingbot && python ./bin/hummingbot_quickstart.py 2>> ./logs/errors.log

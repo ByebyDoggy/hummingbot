@@ -1,10 +1,13 @@
 services:
   hummingbot:
     container_name: hummingbot
-    image: hummingbot/hummingbot:latest
-    # build: # Uncomment this build section and comment image to build Hummingbot locally
+    tty: true
+    stdin_open: true
+    network_mode: host
+    image: hummingbot:latest
+    # build: # Uncomment to build locally
     #   context: .
-    #   dockerfile: Dockerfile
+    #   dockerfile: Dockerfile.proxy
     volumes:
       - ./conf:/home/hummingbot/conf
       - ./conf/connectors:/home/hummingbot/conf/connectors
@@ -21,9 +24,6 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
-    tty: true
-    stdin_open: true
-    network_mode: host
   #  environment:
   #    - CONFIG_PASSWORD=admin
   #    - CONFIG_FILE_NAME=v2_with_controllers.py

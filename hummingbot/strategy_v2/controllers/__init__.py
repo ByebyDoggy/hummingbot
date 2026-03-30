@@ -7,6 +7,11 @@ from hummingbot.strategy_v2.controllers.market_making_controller_base import (
     MarketMakingControllerBase,
     MarketMakingControllerConfigBase,
 )
+from hummingbot.strategy_v2.controllers.signal_controller_base import (
+    SignalControllerBase,
+    SignalControllerConfigBase,
+    SignalType,
+)
 
 __all__ = [
     "ControllerBase",
@@ -15,4 +20,7 @@ __all__ = [
     "DirectionalTradingControllerConfigBase",
     "MarketMakingControllerBase",
     "MarketMakingControllerConfigBase",
+    "SignalControllerBase",
+    "SignalControllerConfigBase",
+    "SignalType",
 ]
